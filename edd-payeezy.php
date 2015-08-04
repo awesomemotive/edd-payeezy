@@ -25,14 +25,17 @@ class EDD_Payeezy_Gateway {
 
 		$this->plugin_url = plugin_dir_url( __FILE__ );
 
-		add_action( 'edd_payeezy_cc_form', array( $this, 'card_form' ) );
-		add_action( 'edd_gateway_2checkout', array( $this, 'process_payment' ) );
-		add_action( 'wp_enqueue_scripts', array( $this, 'scripts' ) );
+		if( ! class_exists( 'Payeezy' ) ) {
+			require_once plugin_dir_path( __FILE__ ) . 'vendor/payeezy.php';
+		}
+
+		//add_action( 'edd_payeezy_cc_form', array( $this, 'card_form' ) );
+		add_action( 'edd_gateway_payeezy', array( $this, 'process_payment' ) );
+		//add_action( 'wp_enqueue_scripts', array( $this, 'scripts' ) );
 		add_action( 'init', array( $this, 'process_webhooks' ) );
 
 		add_filter( 'edd_payment_gateways', array( $this, 'register_gateway' ) );
 		add_filter( 'edd_settings_gateways', array( $this, 'settings' ) );
-		add_filter( 'edd_payment_details_transaction_id-payeezy', array( $this, 'link_transaction_id' ), 11, 2 );
 	}
 
 	/**
@@ -51,7 +54,7 @@ class EDD_Payeezy_Gateway {
 
 
 	/**
-	 * Process the purchase data and send to 2checkout
+	 * Process the purchase data and send to Payeezy
 	 *
 	 * @since 1.0
 	 * @return void
@@ -59,36 +62,84 @@ class EDD_Payeezy_Gateway {
 	public function process_payment( $purchase_data ) {
 		global $edd_options;
 
-		$credentials = $this->get_api_credentials();
-		foreach ( $credentials as $cred ) {
-			if ( is_null( $cred ) ) {
-				edd_set_error( 0, __( 'You must enter your Account Name and Secret Word in settings', 'edd-payeezy' ) );
-				edd_send_back_to_checkout( '?payment-mode=' . $purchase_data['post_data']['edd-gateway'] );
+		
+		$url     = edd_is_test_mode() ? 'https://api-cert.payeezy.com/v1/transactions' : 'https://api.payeezy.com/v1/transactions';
+		$payeezy = new Payeezy;
+		$payeezy::setApiKey( edd_get_option( 'payeezy_api_key' ) );
+		$payeezy::setApiSecret( edd_get_option( 'payeezy_api_secret' ) );
+		$payeezy::setMerchantToken( edd_get_option( 'payeezy_token' ) );
+		$payeezy::setUrl( $url );
+
+		$month     = $purchase_data['card_info']['card_exp_month'];
+		$month     = $month > 9 ? $month : '0' . $month; // Payeezy requires two digits
+		$year      = substr( $purchase_data['card_info']['card_exp_year'], -2 );
+		$card_type = edd_detect_cc_type( $purchase_data['card_info']['card_number'] );
+
+		switch( $card_type ) {
+
+			case 'amex' :
+
+				$card_type = 'American Express';
+				break;
+
+		}
+
+		$response  = json_decode( $payeezy->purchase( array(
+			'amount'           => $purchase_data['price'],
+			'card_number'      => $purchase_data['card_info']['card_number'],
+			'card_type'        => $card_type,
+			'card_holder_name' => $purchase_data['card_info']['card_name'],
+			'card_cvv'         => $purchase_data['card_info']['card_cvc'],
+			'card_expiry'      => $month . $year,
+			'currency_code'    => 'USD',
+		) ) );
+
+
+		if ( 'failed' === $response->validation_status ) {
+
+			foreach( $response->Error->messages as $error ) {
+
+				edd_set_error( $error->code, $error->description );
+				
 			}
-		}
 
-		$payment_data = array(
-			'price'         => $purchase_data['price'],
-			'date'          => $purchase_data['date'],
-			'user_email'    => $purchase_data['post_data']['edd_email'],
-			'purchase_key'  => $purchase_data['purchase_key'],
-			'currency'      => edd_get_currency(),
-			'downloads'     => $purchase_data['downloads'],
-			'cart_details'  => $purchase_data['cart_details'],
-			'user_info'     => $purchase_data['user_info'],
-			'status'        => 'pending'
-		);
-
-		// record the pending payment
-		$payment = edd_insert_payment( $payment_data );
-
-		if ( $payment ) {
-
-
-		} else {
-			// if errors are present, send the user back to the purchase page so they can be corrected
 			edd_send_back_to_checkout( '?payment-mode=payeezy' );
+
+		} elseif ( 'success' === $response->validation_status ) {
+
+			if( 'approved' === $response->transaction_status ) {
+
+				$payment_data = array(
+					'price'         => $purchase_data['price'],
+					'date'          => $purchase_data['date'],
+					'user_email'    => $purchase_data['post_data']['edd_email'],
+					'purchase_key'  => $purchase_data['purchase_key'],
+					'currency'      => edd_get_currency(),
+					'downloads'     => $purchase_data['downloads'],
+					'cart_details'  => $purchase_data['cart_details'],
+					'user_info'     => $purchase_data['user_info'],
+					'status'        => 'pending'
+				);
+
+				// record the pending payment
+				$payment_id = edd_insert_payment( $payment_data );
+
+				edd_update_payment_status( $payment_id, 'publish' );
+				edd_set_payment_transaction_id( $payment_id, $response->transaction_id );
+
+				// Empty the shopping cart
+				edd_empty_cart();
+				edd_send_to_success_page();
+
+			} else {
+
+				edd_set_error( 'payeezy_error', sprintf( __( 'Transaction not approved. Status: %s', 'edd-payeezy' ), $response->transaction_status ) );
+				edd_send_back_to_checkout( '?payment-mode=payeezy' );
+
+			}
+
 		}
+		
 	}
 
 	/**
@@ -124,30 +175,32 @@ class EDD_Payeezy_Gateway {
 				'desc' => __( 'Enter your Payeezy API secret, obtained from the <a href="https://developer.payeezy.com/user/me/apps">Payeezy Developer</a> site', 'edd-payeezy' ),
 				'type' => 'text'
 			),
-			array(
+			/*array(
 				'id' => 'payeezy_js_security_key',
 				'name' => __( 'Payeezy JS Security Key', 'edd-payeezy' ),
 				'desc' => __( 'Enter your Payeezy JS Security Key, obtained from the <a href="https://developer.payeezy.com/user/me/apps">Payeezy Developer</a> site', 'edd-payeezy' ),
 				'type' => 'text'
-			),
+			),*/
 			array(
-				'id' => 'payeezy_ta_token',
-				'name' => __( 'Payeezy Transarmor Token', 'edd-payeezy' ),
-				'desc' => __( 'Enter your Payeezy Transarmer Token, obtained from the <a href="https://developer.payeezy.com/user/me/apps">Payeezy Developer</a> site', 'edd-payeezy' ),
+				'id' => 'payeezy_token',
+				'name' => __( 'Payeezy Token', 'edd-payeezy' ),
+				'desc' => __( 'Enter your Payeezy Token, obtained from the <a href="https://developer.payeezy.com/user/me/merchants">Payeezy Developer</a> site', 'edd-payeezy' ),
 				'type' => 'text'
 			),
-			array(
+			/*array(
 				'id' => 'payeezy_reporting_token',
 				'name' => __( 'Payeezy Reporting Token', 'edd-payeezy' ),
 				'desc' => __( 'Enter your Payeezy reporting token, obtained from the <a href="https://developer.payeezy.com/user/me/apps">Payeezy Developer</a> site', 'edd-payeezy' ),
 				'type' => 'text'
-			),
+			),*/
 		);
 
 		return array_merge( $settings, $edd_payeezy_settings );
 	}
 
 	/**
+	 * NOT USED AT THIS TIME
+	 *
 	 * Payeezy uses it's own credit card form because the card details are tokenized.
 	 *
 	 * We don't want the name attributes to be present on the fields in order to prevent them from getting posted to the server
@@ -242,6 +295,12 @@ class EDD_Payeezy_Gateway {
 		return $form;
 	}
 
+	/**
+	 * NOT USED AT THIS TIME
+	 *
+	 * @since 1.0
+	 * @return void
+	 */
 	public function scripts( $override = false ) {
 
 		if ( ! function_exists( 'edd_is_checkout' ) ) {
@@ -266,27 +325,13 @@ class EDD_Payeezy_Gateway {
 	}
 
 	/**
-	 * Process webhooks sent from 2checkout
+	 * Process webhooks sent from Payeezy - NOT USED AT THIS TIME
 	 *
 	 * @since 1.0
 	 * @return void
 	 */
 	public function process_webhooks() {
 
-	}
-
-	/**
-	 * Turn transaction ID into a URL
-	 *
-	 * @since 1.0
-	 * @return string
-	 */
-	public function link_transaction_id( $transaction_id = '', $payment_id = 0 ) {
-		
-		$base_url = 'https://' . ( edd_is_test_mode() ? 'sandbox.' : '' ) . '2checkout.com/sandbox/sales/detail?sale_id=';
-		$url      = '<a href="' . esc_url( $base_url . $transaction_id ) . '" target="_blank">' . $transaction_id . '</a>';
-
-		return apply_filters( 'edd_2checkout_link_payment_details_transaction_id', $url );
 	}
 
 }
